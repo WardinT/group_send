@@ -1,0 +1,1265 @@
+<?php
+
+/**
+ * TODO
+ *
+ * Konfigurationsdialog für Term-Referenz-Feld (hier: field_zugriffsrechte)
+ * Konfigurationsdialog für Empfängername (hier: realname)
+ * Dateianlagen nach Versand löschen
+ *
+ */
+ 
+/**
+ * @file
+ *   The Group Send module.
+ *
+ * Group Send allows mass mailing to members of groups using Views.
+ *
+ * @ingroup group_send
+ */
+
+/**
+ * e-mail priorities.
+ */
+define('GROUP_SEND_PRIORITY_NONE', 0);
+define('GROUP_SEND_PRIORITY_HIGHEST', 1);
+define('GROUP_SEND_PRIORITY_HIGH', 2);
+define('GROUP_SEND_PRIORITY_NORMAL', 3);
+define('GROUP_SEND_PRIORITY_LOW', 4);
+define('GROUP_SEND_PRIORITY_LOWEST', 5);
+
+/**
+ * Capture PHP max_execution_time before drupal_cron_run().
+ * Workaround for Drupal 6.14. See http://drupal.org/node/584334
+ */
+define('GROUP_SEND_MAX_EXECUTION_TIME', ini_get('max_execution_time'));
+
+/**
+ * Token pattern.
+ */
+define('GROUP_SEND_TOKEN_PATTERN', 'group-send:%s');
+define('GROUP_SEND_TOKEN_PREFIX', '[');
+define('GROUP_SEND_TOKEN_POSTFIX', ']');
+
+/**
+ * Detect if there is MIME support (through modules like Mime Mail or Mandrill).
+ */
+switch (true) {
+  case (module_exists('htmlmail') && module_exists('mailmime')):
+  case module_exists('mailgun'):
+  case module_exists('mandrill'):
+  case module_exists('mimemail'):
+  case module_exists('sendgrid_integration'):
+  case module_exists('swiftmailer'):
+    define('GROUP_SEND_MIMEMAIL', TRUE);
+    break;
+
+  default:
+    define('GROUP_SEND_MIMEMAIL', FALSE);
+}
+
+/**
+ * Gets the selector field if it exists on the passed-in view.
+ *
+ * @return
+ *  The field object if found. Otherwise, FALSE.
+ */
+function _group_send_get_field_selector($view) {
+  foreach ($view->field as $field_name => $field) {
+    if ($field instanceof group_send_handler_field_selector) {
+      // Add in the view object for convenience.
+      $field->view = $view;
+      return $field;
+    }
+  }
+  return FALSE;
+}
+
+/**
+ * Gets the field value from a specific row in a view.
+ * 
+ * @return
+ *  value of the field in selected row.
+ */
+function _group_send_get_field_value($view, $row_id, $field_id) {
+  $result = $view->style_plugin->get_field($row_id, $field_id);
+  return $result;
+}
+
+/**
+ * Gets the users by group (tid) they are members of.
+ * 
+ * @return
+ *  TID of the selected row(s).
+ */
+ function _group_send_get_group_members($term_id) {
+  $query = new EntityFieldQuery;
+  $query->entityCondition('entity_type', 'user')
+    ->fieldCondition('field_zugriffsrechte', 'tid', $term_id);
+
+  $results = $query->execute();
+
+  if (isset($results['user'])) {
+    return user_load_multiple(array_keys($results['user']));    
+  }
+
+  return FALSE;
+}
+
+/**
+ * Implements hook_views_form_substitutions().
+ */
+function group_send_views_form_substitutions() {
+  // Views check_plains the column label, so do the same here in order for the
+  // replace operation to succeed.
+  $select_all_placeholder = check_plain('<!--group-send-select-all-->');
+  $select_all = array(
+    '#type' => 'checkbox',
+    '#default_value' => FALSE,
+    '#attributes' => array('class' => array('group-send-table-select-all')),
+  );
+  return array(
+    $select_all_placeholder => drupal_render($select_all),
+  );
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function group_send_form_alter(&$form, &$form_state, $form_id) {
+  if (strpos($form_id, 'views_form_') === 0) {
+    $field = _group_send_get_field_selector($form_state['build_info']['args'][0]);
+  }
+  // This form isn't used by Group Send.
+  if (empty($field)) {
+    return;
+  }
+
+  // Allow Group Send to work when embedded using views_embed_view(), or in a block.
+  if (empty($field->view->override_path)) {
+    if (!empty($field->view->preview) || $field->view->display_handler instanceof views_plugin_display_block) {
+      $field->view->override_path = $_GET['q'];
+    }
+  }
+  $query = drupal_get_query_parameters($_GET, array('q'));
+  $form['#action'] = url($field->view->get_url(), array('query' => $query));
+
+  // Cache the built form to prevent it from being rebuilt prior to validation
+  // and submission, which could lead to data being processed incorrectly,
+  // because the views rows (and thus, the form elements as well) have changed
+  // in the meantime. Matching views issue: http://drupal.org/node/1473276.
+  $form_state['cache'] = TRUE;
+
+  // Add the custom CSS for all steps of the form.
+  $form['#attached']['css'][] = drupal_get_path('module', 'group_send') . '/group_send.css';
+
+  if ($form_state['step'] == 'views_form_views_form') {
+    $form['actions']['submit']['#value'] = t('E-Mail group(s)');
+    $form['actions']['submit']['#submit'] = array('group_send_form_submit');
+    if (isset($form['#prefix']) && ($form['#prefix'] == '<div class="vbo-views-form">')) {
+      $form['#prefix'] = '<div class="vbo-views-form group-send-selection-form">';
+    }
+    else {
+      $form['#prefix'] = '<div class="group-send-selection-form">';
+    }
+    $form['#suffix'] = '</div>';
+
+    // Add the custom JS for this step of the form.
+    $form['#attached']['js'][] = drupal_get_path('module', 'group_send') . '/group_send.js';
+  }
+}
+
+/**
+ * Multistep form callback for the "configure" step.
+ *
+ */
+function group_send_config_form($form, &$form_state, $view, $output) {
+
+global $user;
+
+ if (!empty($form_state['configuration'])) {
+    // Values entered in the "config" step.
+    $config = $form_state['configuration'];
+  }
+  $display = $view->name . ':' . $view->current_display;
+  $form['display'] = array(
+    '#type' => 'value',
+    '#value' => $display,
+  );
+  $form['from'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Sender'),
+    '#collapsible' => TRUE,
+    '#collapsed' => FALSE,
+	'#access' => FALSE,
+  );
+  $form['from']['group_send_from_name'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Sender\'s name'),
+    '#description' => t("Enter the sender's human readable name."),
+    '#default_value' => user_load($user->uid)->realname,
+    '#maxlen' => 255,
+	'#access' => FALSE,
+  );
+  $form['from']['group_send_from_mail'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Sender\'s e-mail'),
+    '#description' => t("Enter the sender's e-mail address."),
+    '#required' => TRUE,
+    '#default_value' => $user->mail,
+    '#maxlen' => 255,
+	'#access' => FALSE,
+  );
+  
+  $fields = _group_send_get_fields_and_tokens($view, 'fields');
+  $tokens = _group_send_get_fields_and_tokens($view, 'tokens');
+  $fields_name_text = _group_send_get_fields_and_tokens($view, 'fields_name_text');
+  $fields_options = array_merge(array('' => '<' . t('select') . '>'), $fields);
+
+  $form['group_send_tokens'] = array(
+    '#type' => 'value',
+    '#value' => $tokens,
+  );
+
+  // Default row with recipient groups' tids
+  if ((empty($form_state['configuration'])) && (in_array('TID (tid)', $fields) !== FALSE)) {
+	  $config['group_send_to_groups'] = 'tid_pos_0';
+  }
+  $form['to'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Recipient Group(s)'),
+    '#collapsible' => TRUE,
+    '#collapsed' => FALSE,
+	'#access' => ($config['group_send_to_groups'] == 'tid_pos_0') ? FALSE : TRUE,
+  );  
+  $form['to']['group_send_to_groups'] = array(
+    '#type' => 'select',
+    '#title' => t('Field used for recipient group(s)'),
+    '#description' => t('Select which field from the current view will be used as recipients group(s).'),
+    '#options' => $fields_options,
+    '#default_value' => isset($config['group_send_to_groups']) ? $config['group_send_to_groups'] : variable_get('group_send_to_groups_' . $display, ''),
+	'#access' => ($config['group_send_to_groups'] == 'tid_pos_0') ? FALSE : TRUE,
+  );
+  $form['mail'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('E-mail content'),
+    '#collapsible' => TRUE,
+    '#collapsed' => FALSE,
+  );  
+  $form['mail']['group_send_subject'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Subject'),
+    '#description' => t('Enter the e-mail\'s subject.'),
+    '#maxlen' => 255,
+    '#required' => TRUE,
+    '#default_value' => isset($config['group_send_subject']) ? $config['group_send_subject'] : variable_get('group_send_subject_' . $display, ''),
+  );  
+  $form['mail']['group_send_message'] = array(
+    '#type' => 'text_format',
+    '#title' => t('Message'),
+    '#description' => t('Enter the body of the message.'),
+    '#required' => TRUE,
+    '#rows' => 10,
+  );
+  
+  if (isset($config['group_send_message']['value'])) {
+    $form['mail']['group_send_message'] += array(
+      '#format' => $config['group_send_message']['format'],
+      '#default_value' => $config['group_send_message']['value'],
+    );
+  }
+  else {
+    $saved_message = variable_get('group_send_message_' . $display);
+    $form['mail']['group_send_message'] += array(
+      '#format' => isset($saved_message['format']) ? $saved_message['format'] : filter_fallback_format(),
+      '#default_value' => isset($saved_message['value']) ? $saved_message['value'] : '',
+    );
+  }
+  $form['mail']['token'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Tokens'),
+    '#description' => t('You can use the following tokens in the subject or message.'),
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+	'#access' => FALSE,
+  );
+  if (!module_exists('token')) {
+    $form['mail']['token']['tokens'] = array(
+      '#markup' => theme('group_send_token_help', $fields_name_text)
+    );
+  }
+  else {
+    $form['mail']['token']['group_send'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Group Send specific tokens'),
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+    );
+    $form['mail']['token']['group_send']['tokens'] = array(
+      '#markup' => theme('group_send_token_help', $fields_name_text)
+    );
+    $form['mail']['token']['general'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('General tokens'),
+      '#collapsible' => TRUE,
+      '#collapsed' => TRUE,
+    );
+    $token_types = array('site', 'user', 'node', 'current-date');
+    $form['mail']['token']['general']['tokens'] = array(
+      '#markup' => theme('token_tree', array('token_types' => $token_types))
+    );
+  }
+  
+  if (GROUP_SEND_MIMEMAIL && user_access('attachments with group_send')) {
+    // set the form encoding type
+    $form['#attributes']['enctype'] = "multipart/form-data";
+
+    // add a file upload file
+    $form['mail']['group_send_attachments'] = array(
+      '#type' => 'file',
+      '#title' => t('Attachment'),
+      '#description' => t('NB! The attached file is stored once per recipient in the database if you aren\'t sending the message directly.'),
+    );
+  }
+  $form['additional'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Additional e-mail options'),
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE,
+	'#access' => FALSE,
+  );
+  $form['additional']['group_send_priority'] = array(
+    '#type' => 'select',
+    '#title' => t('Priority'),
+    '#options' => array(
+      GROUP_SEND_PRIORITY_NONE => t('none'),
+      GROUP_SEND_PRIORITY_HIGHEST => t('highest'),
+      GROUP_SEND_PRIORITY_HIGH => t('high'),
+      GROUP_SEND_PRIORITY_NORMAL => t('normal'),
+      GROUP_SEND_PRIORITY_LOW => t('low'),
+      GROUP_SEND_PRIORITY_LOWEST => t('lowest')
+    ),
+    '#description' => t('Note that e-mail priority is ignored by a lot of e-mail programs.'),
+    '#default_value' => isset($config['group_send_priority']) ? $config['group_send_priority'] : variable_get('group_send_priority_' . $display, 0),
+  );
+  $form['additional']['group_send_receipt'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Request receipt'),
+    '#default_value' => isset($config['group_send_receipt']) ? $config['group_send_receipt'] : variable_get('group_send_receipt_' . $display, 0),
+    '#description' => t('Request a Read Receipt from your e-mails. A lot of e-mail programs ignore these so it is not a definitive indication of how many people have read your message.'),
+  );
+  $form['additional']['group_send_headers'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Additional headers'),
+    '#description' => t("Additional headers to be send with the message. You'll have to enter one per line. Example:<pre>Reply-To: noreply@example.com\nX-MyCustomHeader: Whatever</pre>"),
+    '#rows' => 4,
+    '#default_value' => isset($config['group_send_headers']) ? $config['group_send_headers'] : variable_get('group_send_headers_' . $display, ''),
+  );
+  $form['group_send_direct'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Send the message directly using the Batch API.'),
+    '#default_value' => isset($config['group_send_direct']) ? $config['group_send_direct'] : variable_get('group_send_direct_'. $display, TRUE),
+	'#access' => FALSE,
+  );
+  $form['group_send_carbon_copy'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Send a copy of the message to the sender.'),
+    '#default_value' => isset($config['group_send_carbon_copy']) ? $config['group_send_carbon_copy'] : variable_get('group_send_carbon_copy_' . $display, TRUE),
+  );
+  $query = drupal_get_query_parameters($_GET, array('q'));
+  $form['actions'] = array(
+    '#type' => 'container',
+    '#attributes' => array('class' => array('form-actions')),
+    '#weight' => 999,
+  );
+  $form['actions']['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Next'),
+    '#validate' => array('group_send_config_form_validate'),
+    '#submit' => array('group_send_form_submit'),
+    '#suffix' => l(t('Cancel'), $view->get_url(), array('query' => $query)),
+  );
+  
+  return $form;
+}
+
+/**
+ * Validation callback for the "configure" step.
+ */
+function group_send_config_form_validate($form, &$form_state) {
+  $values =& $form_state['values'];
+  $view = $form_state['build_info']['args'][0];
+
+  $formats = filter_formats();
+  if (!filter_access($formats[$values['group_send_message']['format']])) {
+    form_set_error('group_send_message', t('Illegal format selected'));
+  }
+  // Check if sender's e-mail is a valid one.
+  if (!valid_email_address(trim($values['group_send_from_mail']))) {
+    form_set_error(['group_send_from_mail'],
+      t('The sender\'s e-mail is not a valid e-mail address: %mail',
+        array('%mail' => $values['group_send_from_mail'])
+      )
+    );
+  }
+}
+
+/**
+ * Multistep form callback for the "confirm" step.
+ * Allows the user to preview the whole message before sending it.
+ */
+function group_send_confirm_form($form, &$form_state, $view, $output) {
+  drupal_set_title(t('Review and confirm the message that is about to be sent'));
+  
+  global $user;
+
+  // Values entered in the "config" step.
+  $configuration = $form_state['configuration'];
+
+  if (!GROUP_SEND_MIMEMAIL && ($configuration['group_send_message']['format'] != 'plain_text')) {
+    drupal_set_message(
+      t("Only plain text is supported in the message. Any HTML will be converted to text. If you want to format the message with HTML, you'll have to install and enable the !mimemail or !mandrill module.",
+        array(
+          '!mimemail' => '<a href="http://drupal.org/project/mimemail">Mime Mail</a>',
+          '!mandrill' => '<a href="http://drupal.org/project/mandrill">Mandrill</a>'
+        )
+      )
+    );
+  }
+
+  // From: parts.
+  $from_mail = trim($configuration['group_send_from_mail']);
+  $from_name = trim($configuration['group_send_from_name']);
+
+  $form['#attributes']['class'] = array('group-send-preview');
+  $form['from'] = array(
+    '#type' => 'item',
+    '#title' => t('From'),
+    '#markup' => '<div class="group-send-preview-value">' .
+        check_plain(_group_send_format_address($from_mail, $from_name, FALSE)) .
+      '</div>',
+  );
+
+  // To: parts. (Mail is mandatory, name is optional.)
+  $recipients = array();
+  $to_groups = array();
+
+  // Resolve the groups' members names and addresses from the groups' tids.
+
+  if (!empty($configuration['group_send_to_groups'])) {
+	  $group_field = $configuration['group_send_tokens'][$configuration['group_send_to_groups']];
+	  foreach ($form_state['selection'] as $row_id) {  
+		 $group_tid = _group_send_get_field_value($view, $row_id, $group_field);
+		 $term = taxonomy_term_load($group_tid);
+		 $to_groups[] = $term->name;
+		 $recipient_groups[] = _group_send_get_group_members($group_tid);
+		 foreach ($recipient_groups as $groups) {
+			 if (!empty($groups)) {
+				 foreach ($groups as $rec) {
+					$rec_list[] = check_plain(_group_send_format_address($rec->mail, $rec->realname, TRUE));
+					$recipients[] = sprintf('"%s" <%s>', $rec->realname, $rec->mail);
+				 } 
+			 }
+			 else {
+				 drupal_set_message(t('At least one group has no members.'), 'error', FALSE);
+			 }
+		 }
+	  }
+  }
+  $rec_list = array_unique($rec_list);
+  $form_state['group-send-recipients'] = array_unique($recipients);
+  $form['to_groups'] = array(
+    '#type' => 'item',
+    '#title' => t('To Groups'),
+    '#markup' => '<div id="group-send-preview-to" class="group-send-preview-value">' . implode(', ', $to_groups) . '</div>',
+	);
+  $form['to'] = array(
+    '#type' => 'item',
+    '#title' => t('To'),
+    '#markup' => '<div id="group-send-preview-to" class="group-send-preview-value">' . implode(', ', $rec_list) . '</div>',
+	'#access' => ($user->uid == 1) ? TRUE : FALSE,
+	);
+  $form['subject'] = array(
+    '#type' => 'item',
+    '#title' => t('Subject'),
+    '#markup' => '<div class="group-send-preview-value">' . check_plain($configuration['group_send_subject']) . '</div>',
+  );
+  $form['message'] = array(
+    '#type' => 'item',
+    '#title' => t('Message'),
+    '#markup' => '<div id="group-send-preview-message" class="group-send-preview-value">' . check_markup($configuration['group_send_message']['value'], $configuration['group_send_message']['format']) . '</div>',
+  );
+
+  $headers = array();
+  foreach (_group_send_headers($configuration['group_send_receipt'], $configuration['group_send_priority'], $configuration['group_send_headers']) as $key => $value) {
+    $headers[] = check_plain($key . ': ' . $value);
+  }
+
+  $form['headers'] = array(
+    '#type' => 'item',
+    '#title' => t('Headers'),
+    '#markup' => '<div id="group-send-preview-headers" class="group-send-preview-value">' . implode('<br />', $headers) . '</div>',
+	'#access' => FALSE,
+  );
+  if (GROUP_SEND_MIMEMAIL && !empty($configuration['group_send_attachments']) && user_access('attachments with group_send')) {
+    foreach ($configuration['group_send_attachments'] as $attachment) {
+      $attachments[] = check_plain($attachment['filename']);
+    }
+    $form['attachments'] = array(
+      '#type' => 'item',
+      '#title' => t('Attachments'),
+      '#markup' => '<div id="group-send-preview-attachments" class="group-send-preview-value">'. implode('<br />', $attachments) .'</div>',
+    );
+  }
+
+  $query = drupal_get_query_parameters($_GET, array('q'));
+  $form['actions'] = array(
+    '#type' => 'container',
+    '#attributes' => array('class' => array('form-actions')),
+    '#weight' => 999,
+  );
+  $form['actions']['back'] = array(
+    '#type' => 'submit',
+    '#value' => t('Go back'),
+    '#submit' => array('group_send_form_back_submit'),
+  );
+  $form['actions']['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Send'),
+    '#submit' => array('group_send_form_submit'),
+    '#suffix' => l(t('Cancel'), $view->get_url(), array('query' => $query)),
+  );
+
+  return $form;
+}
+
+/**
+ * Submit handler for all steps of the Group Send multistep form.
+ */
+function group_send_form_submit($form, &$form_state) {
+  $field = _group_send_get_field_selector($form_state['build_info']['args'][0]);
+
+  switch ($form_state['step']) {
+    case 'views_form_views_form':
+      $field_name = $field->options['id'];
+      $selection = array_filter($form_state['values'][$field_name]);
+      $form_state['selection'] = array_keys($selection);
+
+      $form_state['step'] = 'group_send_config_form';
+      $form_state['rebuild'] = TRUE;
+      break;
+
+    case 'group_send_config_form':
+      $display = $form['display']['#value'];
+      foreach ($form_state['values'] as $key => $value) {
+        $key = ($key == 'format') ? 'group_send_message_format' : $key;
+        if (substr($key, 0, 11) == 'group_send_') {
+			variable_del($key . '_' . $display);
+        }
+      }
+      $form_state['configuration'] = $form_state['values'];
+      $form_state['configuration']['group_send_attachments'] = array();
+
+      // If a file was uploaded, process it.
+      if (GROUP_SEND_MIMEMAIL && user_access('attachments with group_send') && isset($_FILES['files']) && is_uploaded_file($_FILES['files']['tmp_name']['group_send_attachments'])) {
+        // attempt to save the uploaded file
+        $dir = file_default_scheme() . '://public/group_send_attachments';
+        file_prepare_directory($dir, FILE_CREATE_DIRECTORY);
+        $file_extensions = variable_get('group_send_attachment_valid_extensions', FALSE);
+        if ($file_extensions) {
+          $file_validators['file_validate_extensions'] = array();
+          $file_validators['file_validate_extensions'][0] = $file_extensions;
+        }
+        else {
+          $file_validators = array();
+        }
+        $file = file_save_upload('group_send_attachments', $file_validators, $dir);
+        // set error if file was not uploaded
+        if (!$file) {
+          //form_set_error('group_send_attachment', 'Error uploading file.');
+        }
+        else {
+          // set files to form_state, to process when form is submitted
+          // @todo: when we add a multifile formfield then loop through to add each file to attachments array
+          $form_state['configuration']['group_send_attachments'][] = (array)$file;
+        }
+      }
+
+      $form_state['step'] = 'group_send_confirm_form';
+      $form_state['rebuild'] = TRUE;
+      break;
+
+    case 'group_send_confirm_form':
+      // Queue the email for sending.
+	  group_send_queue_mail($form_state['configuration'], $form_state['group-send-recipients'], $field->view);
+
+      // Redirect.
+      $query = drupal_get_query_parameters($_GET, array('q'));
+      $form_state['redirect'] = array($field->view->get_url(), array('query' => $query));
+      break;
+  }
+}
+
+/**
+ * Submit handler that handles back buttons.
+ */
+function group_send_form_back_submit($form, &$form_state) {
+  switch ($form_state['step']) {
+    case 'group_send_confirm_form':
+      $form_state['step'] = 'group_send_config_form';
+      $form_state['rebuild'] = TRUE;
+      break;
+  }
+}
+
+/**
+ * Assembles the email and queues it for sending.
+ *
+ * Also email sent directly using the Batch API is handled here.
+ *
+ * @param $params
+ *   Data entered in the "config" step of the form.
+ * @param $selected_rows
+ *   An array with the indexes of the selected views rows.
+ * @param $view
+ *   The actual view object.
+ */
+function group_send_queue_mail($params, $recipients, $view) {
+  global $user;
+
+  if (!user_access('mass mailing with group_send')) {
+    drupal_set_message(
+      t('No mails sent since you aren\'t allowed to send mass mail with Views. (<a href="@permurl">Edit the permission.</a>)',
+        array('@permurl' => url('admin/people/permissions', array('fragment' => 'module-group_send')))),
+      'error'
+    );
+    return;
+  }
+
+  // From: parts.
+  $from_mail = trim($params['group_send_from_mail']);
+  $from_name = $params['group_send_from_name'];
+ 
+  $subject = $params['group_send_subject'];
+  $body = $params['group_send_message']['value'];
+  $headers = _group_send_headers($params['group_send_receipt'], $params['group_send_priority'], $params['group_send_headers']);
+  $format = $params['group_send_message']['format'];
+  $attachments = $params['group_send_attachments'];
+
+  $formats = filter_formats();
+  if (!filter_access($formats[$format])) {
+    drupal_set_message(t('No mails sent since an illegale format is selected for the message.'));
+    return;
+  }
+  else {
+    $body = check_markup($body, $format);
+  }
+
+  if ($format == 'plain_text') {
+    $plain_format = TRUE;
+  }
+  else {
+    $plain_format = FALSE;
+  }
+
+  $message_base = array(
+    'uid' => $user->uid,
+    'from_name' => trim($from_name),
+    'from_mail' => trim($from_mail),
+    'headers' => $headers,
+  );
+
+  // To: parts
+  foreach ($recipients as $rec) {
+    $to_mail = $rec;
+	$to_name = '';
+
+    // Populate row/context tokens.
+//    $token_keys = $token_values = array();
+//    foreach ($params['group_send_tokens'] as $field_key => $field_name) {
+//      $token_keys[] = GROUP_SEND_TOKEN_PREFIX .  sprintf(GROUP_SEND_TOKEN_PATTERN, $field_name) . GROUP_SEND_TOKEN_POSTFIX;
+//      $token_values[] = _group_send_get_field_value($view, $row_id, $field_name);
+//    }
+
+    // Group Send specific token replacements
+//    $subject = str_replace($token_keys, $token_values, $subject);
+//    $body = str_replace($token_keys, $token_values, $body);
+
+    // Global token replacement, and node/user token replacements
+    // if a nid/uid is found in the views result row.
+//    $data = array();
+//    if (property_exists($view->result[$row_id], 'uid')) {
+//      $data['user'] = user_load($view->result[$row_id]->uid);
+//    }
+//    if (property_exists($view->result[$row_id], 'nid')) {
+//      $data['node'] = node_load($view->result[$row_id]->nid);
+//  }
+//    $subject = token_replace($subject, $data);
+//    $body = token_replace($body, $data);
+
+    if (!GROUP_SEND_MIMEMAIL || (variable_get('mimemail_format', 'plain_text') == 'plain_text')) {
+      $body = drupal_html_to_text($body);
+    }
+
+    $message = $message_base + array(
+      'timestamp' => time(),
+      'to_name' => trim($to_name),
+      'to_mail' => trim($to_mail),
+      'subject' => strip_tags($subject),
+      'body' => $body,
+    );
+
+    // Enable other modules to alter the actual message before queueing it
+    // by providing the hook 'group_send_mail_alter'.
+    drupal_alter('group_send_mail', $message);
+
+    if ($params['group_send_direct']) {
+      $operations[] = array('group_send_batch_deliver', array($message, $plain_format, $attachments));
+    }
+    else {
+      _group_send_prepare_mail($message, $plain_format, $attachments);
+      // Only queue the message if it hasn't been cancelled by another module.
+      if ($message['send']) {
+        unset($message['send']);
+        // Removing stuff add to work around Swifth Mailer issue 2841663
+        if (module_exists('swiftmailer')) {
+          unset($message['params']);
+        }
+
+        db_insert('group_send_spool')->fields($message)->execute();
+        if (module_exists('rules')) {
+          rules_invoke_event('group_send_email_added_to_spool', $message);
+        }
+
+        // Enabled other modules to act just after a message is queued
+        // by providing the hook 'group_send_mail_queued'.
+        module_invoke_all('group_send_mail_queued', $message, $view, $to);
+      }
+      else {
+        unset($recipients[$rec]);
+      }
+    }
+  }
+
+  if ($params['group_send_direct']) {
+    if ($params['group_send_carbon_copy']) {
+      $message['to_name'] = $from_name;
+      $message['to_mail'] = $from_mail;
+      $operations[] = array('group_send_batch_deliver', array($message, $plain_format, $attachments));
+    }
+
+    $batch = array(
+      'operations' => $operations,
+      'finished' => 'group_send_batch_deliver_finished',
+      'progress_message' => t('Sent @current of @total messages.'),
+    );
+    batch_set($batch);
+    drupal_set_message(
+      format_plural(count($recipients), '1 message processed.', '@count messages processed.')
+    );
+  }
+  else {
+    if ($params['group_send_carbon_copy']) {
+      $message['to_name'] = $from_name;
+      $message['to_mail'] = $from_mail;
+      db_insert('group_send_spool')->fields($message)->execute();
+    }
+
+    drupal_set_message(
+      format_plural(count($recipients), '1 message added to the spool.', '@count messages added to the spool.')
+    );
+    if (module_exists('rules')) {
+      rules_invoke_event('group_send_all_email_added_to_spool', count($to_mails));
+    }
+  }
+
+}
+
+// === Hook implementations ====================================================
+
+/**
+ * Implements hook_menu().
+ */
+function group_send_menu() {
+  $items = array();
+  $items['admin/config/system/group_send'] = array(
+    'type' => MENU_NORMAL_ITEM,
+    'title' => 'Group Send',
+    'description' => 'Configure Group Send general options.',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('group_send_settings'),
+    'access arguments' => array('administer group_send'),
+    'file' => 'group_send.admin.inc',
+  );
+  return $items;
+}
+
+/**
+ * Implements hook_permission().
+ */
+function group_send_permission() {
+  $perms = array(
+    'administer group_send' => array(
+      'title' => t('Administer group mails from Views'),
+      'description' => t('Configure sending of e-mails to groups based on Views.'),
+    ),
+    'mass mailing with group_send' => array(
+      'title' => t('Send group mails from Views'),
+      'description' => t('Send e-mails to groups based on Views.'),
+    ),
+  );
+  if (GROUP_SEND_MIMEMAIL) {
+    $perms['attachments with group_send'] = array(
+      'title' => t('Use attachments with Group Send'),
+      'description' => t('Attach files to e-mails sent with Group Send.'),
+    );
+  }
+  return $perms;
+}
+
+/**
+ * Implements hook_theme().
+ */
+function group_send_theme($existing, $type, $theme, $path) {
+  return array(
+    'group_send_select_all' => array(
+      'variables' => array(),
+    ),
+    'group_send_token_help' => array(
+      'arguments' => array('tokens' => array()),
+    ),
+  );
+}
+
+/**
+ * Implements hook_views_api().
+ */
+function group_send_views_api() {
+  return array(
+    'api' => 3,
+    'path' => drupal_get_path('module', 'group_send') . '/views',
+  );
+}
+
+/**
+ * Implements hook_cron().
+ */
+function group_send_cron() {
+  // Load cron functions.
+  module_load_include('cron.inc', 'group_send');
+
+  // Send pending messages from spool.
+  group_send_send_from_spool();
+
+  // Clear successful sent messages.
+  group_send_clear_spool();
+}
+
+/**
+ * Implements hook_mail().
+ */
+function group_send_mail($key, &$message, $params) {
+
+  // This is a simple message send. User inputs the content directly.
+  if ($key == 'direct') {
+
+    // Set the subject.
+    $message['subject'] = $params['subject'];
+
+    // Set the body.
+    $message['body'][] = $params['body'];
+
+    // Add additional headers.
+    $message['headers'] += $params['headers'];
+  }
+
+  // TODO: Implement node message parsing.
+  elseif ($key == 'node') {
+    // Translations, theming, etc...
+  }
+}
+
+// === Helper functions ========================================================
+
+/**
+ * Build header array with priority and receipt confirmation settings.
+ *
+ * @param $receipt
+ *   Boolean: If a receipt is requested.
+ * @param $priority
+ *   Integer: The message priority.
+ * @param $from
+ *   String: The sender's e-mail address.
+ *
+ * @return Header array with priority and receipt confirmation info
+ */
+function _group_send_headers($receipt, $priority, $additional_headers) {
+  $headers = array();
+
+  // If receipt is requested, add headers.
+  if ($receipt) {
+    $headers['Disposition-Notification-To'] = $from;
+    $headers['X-Confirm-Reading-To'] = $from;
+  }
+
+  // Add priority if set.
+  switch ($priority) {
+    case GROUP_SEND_PRIORITY_HIGHEST:
+      $headers['Priority'] = 'High';
+      $headers['X-Priority'] = '1';
+      $headers['X-MSMail-Priority'] = 'Highest';
+      break;
+    case GROUP_SEND_PRIORITY_HIGH:
+      $headers['Priority'] = 'urgent';
+      $headers['X-Priority'] = '2';
+      $headers['X-MSMail-Priority'] = 'High';
+      break;
+    case GROUP_SEND_PRIORITY_NORMAL:
+      $headers['Priority'] = 'normal';
+      $headers['X-Priority'] = '3';
+      $headers['X-MSMail-Priority'] = 'Normal';
+      break;
+    case GROUP_SEND_PRIORITY_LOW:
+      $headers['Priority'] = 'non-urgent';
+      $headers['X-Priority'] = '4';
+      $headers['X-MSMail-Priority'] = 'Low';
+      break;
+    case GROUP_SEND_PRIORITY_LOWEST:
+      $headers['Priority'] = 'non-urgent';
+      $headers['X-Priority'] = '5';
+      $headers['X-MSMail-Priority'] = 'Lowest';
+      break;
+  }
+
+  // Add general headers.
+  $headers['Precedence'] = 'bulk';
+  $headers['Sender'] = variable_get('site_mail', '');
+
+  // Add additional headers.
+  $additional_headers = trim($additional_headers);
+  $additional_headers = str_replace("\r", "\n", $additional_headers);
+  $additional_headers = explode("\n", $additional_headers);
+  foreach ($additional_headers as $header) {
+    $header = trim($header);
+    if (!empty($header)) {
+      list($key, $value) = explode(': ', $header, 2);
+      $headers[$key] = trim($value);
+    }
+  }
+
+  return $headers;
+}
+
+/**
+ * Build a formatted e-mail address.
+ */
+function _group_send_format_address($mail, $name, $encode = TRUE) {
+  // Do not format addres on Windows based PHP systems or when $name is empty.
+  if ((substr(PHP_OS, 0, 3) == 'WIN') || empty($name)) {
+    return $mail;
+  }
+  else {
+    $name = ($encode ? _group_send_mime_header_encode($name) : $name);
+    return sprintf('"%s" <%s>', $name, $mail);
+  }
+}
+
+/**
+ * Returns a mime-encoded string for strings that contain UTF-8.
+ *
+ * Simplified and correct version of mime_header_decode.
+ */ 
+function _group_send_mime_header_encode($string) {
+  if (preg_match('/[^\x20-\x7E]/', $string)) {
+    $string = '=?UTF-8?B?' . base64_encode($string) . '?=';
+  }
+  return $string;
+}
+
+/**
+ * Prepare the mail message before sending or spooling.
+ *
+ * @param array $message
+ *   which contains the following keys:
+ *   from_name
+ *     String holding the Sender's name.
+ *   from_mail
+ *     String holding the Sender's e-mail.
+ *   to_name
+ *     String holding the Recipient's name.
+ *   to_mail
+ *     String holding the Recipient's e-mail.
+ *   subject
+ *     String with the e-mail subject. This argument can be altered here.
+ *   body
+ *     Text with the e-mail body. This argument can be altered here.
+ *   headers
+ *     Associative array with e-mail headers. This argument can be altered here.
+ * @param boolean $plain_format
+ *   Whether the e-mail should be sent in plain format.
+ * @param array $attachments
+ *   An array with file information objects (as returned by file_save_upload).
+ */
+function _group_send_prepare_mail(&$message, $plain_format=TRUE, $attachments=array()) {
+  // Extract all variables/keys from the message.
+  extract($message);
+
+  /**
+   * TODO: In the future, this module will be able to send an existing node.
+   * $key will have to make the difference. A value when we pickup a node, other
+   * when user inputs the subject & body of the message.
+   */
+  $key = 'direct';
+
+  // Build message parameters.
+  $params = array();
+
+  $params['from_name'] = $from_name;
+  $params['from_mail'] = $from_mail;
+  $params['from_formatted'] = _group_send_format_address($from_mail, $from_name);
+
+  $params['to_name'] = $to_name;
+  $params['to_mail'] = $to_mail;
+  $to_mail_formatted = array();
+  foreach (explode(',', $to_mail) as $addr) {
+    $to_mail_formatted[] = _group_send_format_address($addr, $to_name);
+  }
+  $params['to_formatted']  = implode(', ', $to_mail_formatted);
+  $params['subject'] = $subject;
+  $params['body'] = $body;
+  $params['headers'] = $headers;
+
+  if (GROUP_SEND_MIMEMAIL) {
+    $params['attachments'] = $attachments;
+    if ($plain_format) {
+      $params['plain'] = TRUE;
+    }
+  }
+
+  // Call Drupal standard mail function, but without sending.
+  $mail = drupal_mail('group_send', $key, $params['to_formatted'], language_default(), $params, $params['from_formatted'], FALSE);
+
+  // Add additional Mime Mail post processing.
+  if (GROUP_SEND_MIMEMAIL) {
+    // We want to spool the Subject decoded.
+    $mail['subject'] = mime_header_decode($mail['subject']);
+  }
+
+  // Updating message with data from generated mail
+  $message['to_mail'] = $mail['to'];
+  $message['from_mail'] = $mail['from'];
+  $message['subject'] = $mail['subject'];
+  $message['body'] = $mail['body'];
+  $message['send'] = $mail['send'];
+  $message['headers'] = serialize($mail['headers']);
+  // Working around a Swifth Mailer issue - see https://www.drupal.org/node/2841663
+  if (module_exists('swiftmailer')) {
+    $message['params'] = array('attachments' => $params['attachments']);
+  }
+}
+
+/**
+ * Sending a prepared message.
+ *
+ * @return
+ *   Boolean indicating if the message was sent successfully.
+ */
+function group_send_deliver($message) {
+  if (is_array($message)) {
+    $message = (object) $message;
+  }
+
+  $key = 'direct';
+  $headers = unserialize($message->headers);
+
+  $mail = array(
+    'id' => 'group_send_' . $key,
+    'module' => 'group_send',
+    'key' => $key,
+    'to' => $message->to_mail,
+    'from' => $message->from_mail,
+    'subject' => $message->subject,
+    'body' => $message->body,
+    'headers' => $headers,
+  );
+
+  // Because of Swifth Mailer issue 2841663
+  if (module_exists('swiftmailer')) {
+    $mail['params'] = $message->params;
+  }
+
+  // Mime encode the subject before passing to the mail function 
+  // to work around a bug in Drupal's mime_header_encode.
+  $mail['subject'] = _group_send_mime_header_encode($message->subject);
+  $system = drupal_mail_system('group_send', $key);
+
+  return $system->mail($mail);
+}
+
+/**
+ * Preparing and sending a message (coming from a batch job).
+ */
+function group_send_batch_deliver($message, $plain_format, $attachments, &$context) {
+  _group_send_prepare_mail($message, $plain_format, $attachments);
+  if (!$message['send']) {
+    $context['results'][] = t('Skipping sending message to %mail.',
+      array('%mail' => $message['to_mail']));
+    return;
+  }
+  else {
+    unset($message['send']);
+  }
+  
+  $status = group_send_deliver($message);
+
+  if ($status) {
+    if (variable_get('group_send_debug', FALSE)) {
+      watchdog('group_send', 'Message sent to %mail.', array('%mail' => $message['to_mail']));
+    }
+    if (module_exists('rules')) {
+      rules_invoke_event('group_send_email_sent', $message);
+    }
+  }
+  else {
+    $context['results'][] = t('Failed sending message to %mail directly - spooling it.',
+      array('%mail' => $message['to_mail']));
+    // Queue the message to the spool table.
+    db_insert('group_send_spool')->fields($message)->execute();
+    if (module_exists('rules')) {
+      rules_invoke_event('group_send_email_added_to_spool', $message);
+    }
+  }
+}
+
+/**
+ * Displays status after sending messages as a batch job.
+ */
+function group_send_batch_deliver_finished($success, $results, $operations) {
+  if ($success) {
+    foreach ($results as $result) {
+      drupal_set_message($result);
+    }
+  }
+}
+
+// === Theming functions =======================================================
+
+/**
+ * Theme the replacement tokens.
+ *
+ * @param $tokens:
+ *   Keyed array with tokens as keys and description as values.
+ *
+ * @return
+ *   A themed table wirh all tokens.
+ *
+ * @todo: Add help for other tokens
+ */
+function theme_group_send_token_help($fields) {
+  $header = array(t('Token'), t('Replacement value'));
+  $rows = array();
+  foreach ($fields as $field => $title) {
+    $rows[] = array(GROUP_SEND_TOKEN_PREFIX .  sprintf(GROUP_SEND_TOKEN_PATTERN, $field) . GROUP_SEND_TOKEN_POSTFIX, $title);
+  }
+  $output = theme('table', array('header' => $header, 'rows' => $rows));
+  return $output;
+}
+
+/**
+ * Generates and returns fields and tokens.
+ */
+function _group_send_get_fields_and_tokens($view, $type) {
+  static $return;
+  if (isset($return[$type])) {
+    return $return[$type];
+  }
+  if (!in_array($type, array('fields', 'tokens', 'fields_name_text')) || !$view) {
+    return FALSE;
+  }
+  $fields = array();
+  $tokens = array();
+  $fields_name_text = array();
+  foreach ($view->field as $field_name => $field) {
+    // Ignore Views Form fields.
+    if (property_exists($field, 'views_form_callback') || method_exists($field, 'views_form')) {
+      continue;
+    }
+    if ($field instanceof views_handler_field_custom) {
+      $field_key = $field_name;
+      // Using a nice field name (for tokens) for custom text fields.
+      $field_name = str_replace('nothing', 'custom_text', $field_name);;
+    } 
+    elseif (!empty($field->field_info)) {
+      $field_key = $field->field_info['field_name'];
+    }
+    elseif (property_exists($field, 'field_alias')) {
+      $field_key = $field->field_alias;
+      if ($field_key == 'unknown') {
+        $field_key = $field_name;
+      }
+    }
+    else {
+      $field_key = $field_name;
+    }
+    // Add field position to ensure unique keys.
+    $field_key .= '_pos_' . $field->position;
+    $field_text = $field->label() . ' (' . $field_name . ')';
+    $fields[$field_key] = $field_text;
+    $tokens[$field_key] = $field_name;
+    $fields_name_text[$field_name] = $field_text;
+  }
+
+  $return = array();
+  $return['fields'] = $fields;
+  $return['tokens'] = $tokens;
+  $return['fields_name_text'] = $fields_name_text;
+
+  return $return[$type];
+}
+
+/**
+ * Returns property info for Group Send Email Message
+ */
+function _group_send_email_message_property_info() {
+  $propertyinfo = array(
+    'uid' => array(
+      'type' => 'integer',
+      'label' => t('User ID'),
+    ),
+    'timestamp' => array(
+      'type' => 'integer',
+      'label' => t('Timestamp'),
+    ),
+    'from_name' => array(
+      'type' => 'text',
+      'label' => t('Sender\'s name'),
+    ),
+    'from_mail' => array(
+      'type' => 'text',
+      'label' => t('Sender\'s e-mail'),
+    ),
+    'to_name' => array(
+      'type' => 'text',
+      'label' => t('Recipient\'s name'),
+    ),
+    'to_mail' => array(
+      'type' => 'text',
+      'label' => t('Recipient\'s e-mail'),
+    ),
+    'subject' => array(
+      'type' => 'text',
+      'label' => t('E-mail subject'),
+    ),
+    'body' => array(
+      'type' => 'text',
+      'label' => t('E-mail body'),
+    ),
+    'headers' => array(
+      'type' => 'text',
+      'label' => t('E-mail headers (serialized)'),
+    ),
+  );
+  return $propertyinfo;
+}
+
+
